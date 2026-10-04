@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cmux-codex-usage</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOUR_USERNAME/bin/cmux-codex-usage.sh</string>
+    <string>--update</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd gets no login shell, so include common Codex CLI install paths. -->
+    <key>PATH</key>
+    <string>/Users/YOUR_USERNAME/.local/bin:/Users/YOUR_USERNAME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Applications/cmux.app/Contents/Resources/bin</string>
+    <key>HOME</key>
+    <string>/Users/YOUR_USERNAME</string>
+    <key>CMUX_SOCKET_PATH</key>
+    <string>/Users/YOUR_USERNAME/.local/state/cmux/cmux.sock</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/cmux-codex-usage.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/cmux-codex-usage.err</string>
+</dict>
+</plist>

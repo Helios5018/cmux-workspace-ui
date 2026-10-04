@@ -1,0 +1,16 @@
+# local install backups
+*.bak.*
+.DS_Store
+
+# never commit a real, filled-in sentinel env or token
+usage-sentinels.env
+
+# private working / handoff docs — live in .claude/, knowledge stays in the
+# project but never gets committed to the public repo
+/.claude/
+*.local.md
+
+# task-local scratch and Python caches
+/scratch/
+__pycache__/
+*.py[cod]

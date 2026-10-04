@@ -1,0 +1,702 @@
+// Workspaces sidebar — flat, your manual order (by index). SF Mono.
+// Palette: Ayu Mirage (matches the terminal theme).
+//   bg #1F2430 · fg #D9D7CE · dim #8A9199 · orange #FFCC66 · blue #73D0FF
+//   green #87D96C · red #F28779 · selection #33415E
+//
+// State is modeled as TWO INDEPENDENT dimensions, each on its own row:
+//   1. Agent activity — compacting (purple) / working (green) / needs-you
+//      (orange) / idle (dim). Compacting, waiting & working are read from STATIC
+//      markers the bridge keeps at the FRONT of the TITLE ("⏳"=compacting,
+//      "❓"=waiting-on-you, "⚡"=working); needs-you ALSO triggers on `unread`.
+//      Precedence: compacting > waiting > working > needs-you(unread) > idle.
+//      "Waiting" is the bridge's way of saying Claude asked a question / hit a
+//      permission prompt — the row shows the orange needs-you treatment, not
+//      green "Working…", because the session is parked on YOU.
+//      (Why the title and not `progress` for agent state: the title is the
+//      persistent, restart-proof anchor and encodes the marker-precedence order;
+//      `progress` DOES reach the sidebar on 0.64.17 — meters use it — but it's
+//      transient. Why STATIC: an animated marker in the title freezes cmux's
+//      sidebar — upstream #6291. The bridge ref-counts agents per workspace so
+//      multiple Claude/Codex sessions don't stomp the marker — see
+//      .claude/STATE-ARCHITECTURE.md.)
+//   2. Repo state — branch · uncommitted · PR. Independent of any agent; its
+//      own row so it never competes with activity for the line.
+// Usage meters ride hidden "sentinel" workspaces (see isUsageMeter).
+
+// ── predicates ────────────────────────────────────────────────────
+func hasPR(_ w) -> Bool {
+  if let label = w.pr.label { return label != "" }
+  return false
+}
+func hasBranch(_ w) -> Bool {
+  if let branch = w.branch { return branch != "" }
+  return false
+}
+func hasProgress(_ w) -> Bool {
+  if let value = w.progress.value { return value >= 0 }
+  return false
+}
+func hasProgressLabel(_ w) -> Bool {
+  if let label = w.progress.label { return hasProgress(w) && label != "" }
+  return false
+}
+
+// ── dimension 1: agent activity ───────────────────────────────────
+// Two sources, OR-ed, so every cmux version keeps working:
+//   1. STATIC title markers the bridge injects at the FRONT of the TITLE ("⚡ name").
+//      Persistent, precedence-ordered, and the ONLY source of ⏳ compacting.
+//   2. cmux ≥ 0.64.23 projects its own hook-driven session registry as
+//      `w.agents[]` (kind / status / lastActivityAt). That lights up EVERY agent
+//      cmux hooks — Codex, opencode, pi, cursor… — with no adapter of ours. On an
+//      older cmux the field is simply absent and only the markers count.
+// TRAP: `w.agents != nil` is ALWAYS false on this interpreter, even with agents
+// present (arrays don't compare to nil; dictionaries like `w.pr` do). Guard with
+// `.count > 0`, which is false for an absent array. Also: `var` mutation and
+// `return` inside a `for` loop silently do nothing here — use `.filter { }`, whose
+// closures DO capture outer names. All probed 2026-09-15.
+// A native `working` untouched for an hour is treated as stale: a turn that ends
+// without a Stop hook (Esc interrupt, a plugin host that never exits) otherwise
+// reads "working" forever. Same reasoning and the same default as the bridge's
+// CMUX_SENTINEL_WORK_TTL; `lastActivityAt` advances on every hook event, so only a
+// single tool call running past an hour could be dropped early.
+func workingAgentCount(_ w) -> Int {
+  if w.agents.count > 0 {
+    return w.agents.filter { $0.status == "working" && clock.epoch - $0.lastActivityAt < 3600 }.count
+  }
+  return 0
+}
+// cmux's `needs_input` is trusted for every agent EXCEPT Claude. cmux's reducer
+// maps ANY Claude `Notification` hook to needs_input, including the idle "waiting
+// for your input" notice Claude sends ~61s after every turn ends (measured in
+// ~/.cmuxterm/events.jsonl). Trusting it would flip every finished Claude workspace
+// to "needs you" a minute later — the done-marker behaviour that was rejected. The
+// bridge's ❓ already reports Claude precisely (it gates that notice out), so Claude
+// stays on the marker; Codex approvals, Cursor prompts etc. come from cmux.
+func agentNeedsInput(_ w) -> Bool {
+  if w.agents.count > 0 {
+    return w.agents.filter { $0.status == "needs_input" && $0.kind != "claude" }.count > 0
+  }
+  return false
+}
+// "Working" = the bridge's ⚡ marker OR a live native agent. The interpreter's
+// `.hasPrefix` works here (proven), so the marker is detected on the title.
+func isWorking(_ w) -> Bool {
+  if w.title.hasPrefix("⚡") { return true }
+  return workingAgentCount(w) > 0
+}
+// Compacting is a distinct busy sub-state: the bridge swaps the working marker
+// for "⏳" while Claude compacts its context (PreCompact→PostCompact). Static
+// glyph on purpose — an animated/spinner marker in the title freezes cmux's
+// sidebar (upstream #6291). Precedence: compacting > working > needs-you > idle.
+func isCompacting(_ w) -> Bool {
+  return w.title.hasPrefix("⏳")
+}
+// Waiting: the bridge flips the marker to "❓" when Claude is BLOCKED on you —
+// it asked a question (AskUserQuestion / ExitPlanMode) or hit a permission/idle
+// prompt. The session is alive but parked, so this beats "working" and rides the
+// orange needs-you treatment. Markers are mutually exclusive (one leading glyph),
+// so isWaiting ⇒ !isWorking && !isCompacting — for the MARKER. A native non-Claude
+// agent asking for approval counts too (see agentNeedsInput), and waiting outranks
+// working wherever both hold, matching the bridge's precedence.
+func isWaiting(_ w) -> Bool {
+  if w.title.hasPrefix("❓") { return true }
+  return agentNeedsInput(w)
+}
+// needs-you = Claude is waiting on you (the ❓ marker) OR there are unread
+// messages while no agent is mid-turn. Working/compacting outrank a bare unread.
+func needsYou(_ w) -> Bool {
+  if isCompacting(w) { return false }
+  if isWaiting(w) { return true }
+  if isWorking(w) { return false }
+  return w.unread > 0
+}
+// Show working by COLOR, not the glyph: strip the leading "⚡" marker from the
+// displayed title. `.split` keeps the rest of the name intact (spaces and all);
+// cmux trims a leading zero-width space, so a visible marker + strip is the only
+// way to get a clean title.
+// A workspace-group ANCHOR shows its group's NAME. The anchor's own title does not
+// follow a group rename (they diverge), which is why cmux-group-sync.sh used to copy
+// the name into the title. cmux ≥ 0.64.23 binds `groups` directly, so the sidebar
+// reads it; on an older cmux `groups` is empty and the title path below runs as before.
+func groupName(_ w) -> String {
+  let named = groups.filter { $0.anchorId == w.id && $0.name != "" }
+  if named.count > 0 { return named[0].name }
+  return ""
+}
+func isGroupAnchor(_ w) -> Bool {
+  return groups.filter { $0.anchorId == w.id }.count > 0
+}
+func displayTitle(_ w) -> String {
+  if groupName(w) != "" { return groupName(w) }
+  if w.title.hasPrefix("⏳") {
+    let parts = w.title.split(separator: "⏳")
+    if parts.count > 0 { return String(parts[0]) }
+    return ""
+  }
+  if w.title.hasPrefix("❓") {
+    let parts = w.title.split(separator: "❓")
+    if parts.count > 0 { return String(parts[0]) }
+    return ""
+  }
+  if w.title.hasPrefix("⚡") {
+    let parts = w.title.split(separator: "⚡")
+    if parts.count > 0 { return String(parts[0]) }
+    return ""
+  }
+  return w.title
+}
+// "×N" only when cmux reports more than one live agent — the markers can't count.
+func workLabel(_ w) -> String {
+  if hasProgressLabel(w) { return w.progress.label }
+  if workingAgentCount(w) > 1 { return "Working… ×\(workingAgentCount(w))" }
+  return "Working…"
+}
+func activityText(_ w) -> String {
+  if isCompacting(w) { return "Compacting…" }
+  if isWaiting(w) { return "asking…" }   // Claude asked a question / needs permission
+  if isWorking(w) { return workLabel(w) }
+  if needsYou(w) {
+    if w.unread > 1 { return "needs you · \(w.unread)" }
+    return "needs you"
+  }
+  return "idle"
+}
+func activityColor(_ w) -> String {
+  if isCompacting(w) { return "#DFBFFF" }
+  if isWorking(w) { return "#87D96C" }
+  if needsYou(w) { return "#FFCC66" }
+  return "#8A9199"
+}
+// SF Symbol for the activity row; "" = no icon (compared with == elsewhere).
+// Working shows by colour alone (no icon — Oliver: "icon is too much, just colour").
+func activityIcon(_ w) -> String {
+  if needsYou(w) { return "bell.fill" }
+  return ""
+}
+// Idle repo rows already communicate useful state below the title; repeating
+// literal "idle" makes the list taller without adding information. Keep it only
+// for empty rows, while all actionable/active states always get an activity line.
+func showsActivity(_ w) -> Bool {
+  if isCompacting(w) { return true }
+  if isWorking(w) { return true }
+  if needsYou(w) { return true }
+  if hasRepoInfo(w) { return false }
+  return true
+}
+func titleLineLimit(_ w) -> Int {
+  if w.selected { return 2 }
+  if isCompacting(w) { return 2 }
+  if isWorking(w) { return 2 }
+  if needsYou(w) { return 2 }
+  return 1
+}
+
+// ── dimension 2: repo / git state ─────────────────────────────────
+func hasRepoInfo(_ w) -> Bool {
+  if hasPR(w) { return true }
+  if hasBranch(w) { return true }
+  if w.dirty == true { return true }
+  return false
+}
+// Dirty is shown as a compact yellow "*" in the row (native "main*" look), NOT
+// spelled out — "uncommitted changes" truncates and eats the narrow line. So
+// repoText carries only branch / PR label (+ stale); the "*" is appended below.
+func repoText(_ w) -> String {
+  if hasPR(w) {
+    let stale = w.pr.stale == true ? " · stale" : ""
+    return "\(w.pr.label)\(stale)"
+  }
+  if hasBranch(w) { return w.branch }
+  return ""   // dirty-only row: just the branch icon + the yellow "*"
+}
+// Branch / PR label colour. Dirty no longer tints this (the yellow "*" carries it).
+func repoColor(_ w) -> String {
+  if hasPR(w) && w.pr.status == "open" { return "#73D0FF" }
+  return "#8A9199"
+}
+// ── usage meters (hidden sentinels) ───────────────────────────────
+// ONE predicate per provider, matched by the sentinel's TITLE LABEL (not a
+// workspace id). 0.64.15 removed stable workspace UUIDs, leaving only a positional
+// ref that rotates on every app restart, so an id hard-coded here would go stale
+// each restart and the meters would silently fall back into the normal list.
+// 0.64.22 populates `w.id` again, but it is not a proven-durable handle (no public
+// `stableId`) and a hard-coded id would still need a reinstall to change — the
+// label needs neither. The poller keeps each sentinel's title starting with its
+// label ("5h "/"7d "), `.hasPrefix` works in the interpreter (proven), and the
+// bridge prefixes real agent workspaces with ⚡/⏳ (never a bare label), so the
+// label is a collision-free, restart-proof anchor both sides share.
+func isClaudeMeter(_ w) -> Bool {
+  if w.title == "5h" { return true }           // bare bootstrap label (before the first poll paints a bar)
+  if w.title.hasPrefix("5h ") { return true }  // Claude — 5h session window
+  if w.title == "7d" { return true }           // bare bootstrap label (before the first poll paints a bar)
+  if w.title.hasPrefix("7d ") { return true }  // Claude — 7d weekly window
+  // Per-MODEL weekly cap (e.g. a Fable-scoped allowance), opt-in via
+  // CLAUDE_MODEL_METER=1. The MODEL NAME is never part of the anchor — it rides
+  // the title's detail text, because the anchor must be a static literal here and
+  // Anthropic re-scopes which model is capped at will.
+  if w.title == "m7d" { return true }           // bare bootstrap label
+  if w.title.hasPrefix("m7d ") { return true }  // Claude — model-scoped weekly window
+  // Extra-usage (overage) SPEND. Not a time window — money against a monthly
+  // budget. Always a meter (so it never shows up in the normal workspace list),
+  // but the panel hides it while nothing has been spent; see isZeroSpend.
+  if w.title == "spend" { return true }           // bare bootstrap label
+  if w.title.hasPrefix("spend ") { return true }  // Claude — extra-usage spend
+  return false
+}
+// The spend row is the one meter that hides ITSELF. Money you haven't spent is not
+// information, and a permanent "€0.00" row would train you to ignore the very row
+// that matters when it finally moves. The poller writes this exact marker on every
+// run while the balance is zero (and a real bar the moment it isn't), so the row
+// appears and disappears on its own with no setup re-run and no flag.
+func isZeroSpend(_ w) -> Bool {
+  if w.title == "spend" { return true }                // created, never painted yet
+  if w.title.hasPrefix("spend |none|") { return true }  // painted, nothing spent
+  return false
+}
+// What the CLAUDE USAGE panel actually draws. Split from isClaudeMeter on purpose:
+// a hidden spend row must STILL count as a meter, or it would fall through into the
+// normal workspace list — visible in the one place we didn't want it.
+func isClaudePanelRow(_ w) -> Bool {
+  if isZeroSpend(w) { return false }
+  if isClaudeMeter(w) { return true }
+  return false
+}
+// Codex provider — same shape as isClaudeMeter, distinct labels so the two never
+// collide. bin/cmux-codex-usage.sh reads ChatGPT account usage and routes windows
+// by numeric duration (never by unstable primary/secondary position).
+func isCodexMeter(_ w) -> Bool {
+  if w.title == "cx5h" { return true }           // bare bootstrap label
+  if w.title.hasPrefix("cx5h ") { return true }  // Codex — short/session window
+  if w.title == "cx7d" { return true }           // bare bootstrap label
+  if w.title.hasPrefix("cx7d ") { return true }  // Codex — weekly window
+  return false
+}
+// Amp provider — fed by bin/cmux-amp-usage.sh, which scrapes `amp usage`.
+// Labels are distinct from every other provider's ("ampu"/"ampo" can't collide
+// with "5h "/"7d "/"cx5h "/"cx7d "). Unlike the others these are NOT rolling time
+// windows but one monthly subscription allowance: "ampu" = agent/thread usage,
+// "ampo" = orb (remote machine) usage. "ampo" only exists when the user opted in
+// with AMP_ORB_METER=1 — a sentinel costs a ⌘ key, so it isn't created by default.
+func isAmpMeter(_ w) -> Bool {
+  if w.title == "ampu" { return true }           // bare bootstrap label
+  if w.title.hasPrefix("ampu ") { return true }  // Amp — subscription agent usage
+  if w.title == "ampo" { return true }           // bare bootstrap label
+  if w.title.hasPrefix("ampo ") { return true }  // Amp — orb usage (opt-in)
+  return false
+}
+func isGrokMeter(_ w) -> Bool {
+  if w.title == "grokcredits" { return true }
+  return w.title.hasPrefix("grokcredits ")
+}
+func meterIsStale(_ w) -> Bool {
+  if let description = w.description {
+    if description.hasPrefix("sentinel-updated:") {
+      let parts = description.split(separator: ":")
+      if parts.count > 1 { return clock.epoch - Int(parts[1]) > 900 }
+    }
+  }
+  return false
+}
+func isUsageMeter(_ w) -> Bool {
+  if isGrokMeter(w) { return true }
+  if isClaudeMeter(w) { return true }
+  if isCodexMeter(w) { return true }
+  if isAmpMeter(w) { return true }
+  return false
+}
+
+// ── text-only usage rows ──────────────────────────────────────────
+// Show window, percentage and reset countdown. Bars are deliberately hidden;
+// progress remains the live data channel, with title text as the fallback.
+func meterWindow(_ w) -> String {
+  if isGrokMeter(w) { return "week" }   // human label; title anchor remains unchanged
+  if w.title == "5h" { return "session" }
+  if w.title.hasPrefix("5h ") { return "session" }
+  if w.title == "7d" { return "week" }
+  if w.title.hasPrefix("7d ") { return "week" }
+  if w.title == "cx5h" { return "session" }
+  if w.title.hasPrefix("cx5h ") { return "session" }
+  if w.title == "cx7d" { return "week" }
+  if w.title.hasPrefix("cx7d ") { return "week" }
+  if w.title == "ampu" { return "threads" }
+  if w.title.hasPrefix("ampu ") { return "threads" }
+  if w.title == "ampo" { return "orbs" }
+  if w.title.hasPrefix("ampo ") { return "orbs" }
+  // Per-MODEL weekly cap. The model's own name IS the label — "Fable", not
+  // "model Fable", so the row keeps the one-word rhythm of every other meter. It
+  // can never be a literal here (Anthropic re-scopes which model is capped and
+  // scope.model.id is null), so the poller writes it as a 4th title segment:
+  //   m7d |15% (3d 2h)|▉▉░░░|Fable
+  // Split on "|" rather than on the detail's first space, so a name with a space
+  // in it survives. Anything without that segment — the bare bootstrap title, an
+  // "⚠ offline" stamp — falls back to the generic word.
+  if w.title == "m7d" { return "model" }   // bootstrap: created, never painted yet
+  if w.title.hasPrefix("m7d ") {
+    let parts = w.title.split(separator: "|")
+    if parts.count > 3 { return String(parts[3]) }
+    return "model"
+  }
+  // Extra-usage spend. Only ever drawn when there IS spend — a zero balance is
+  // filtered out upstream by isZeroSpend — so this never labels an empty row.
+  if w.title == "spend" { return "credits" }
+  if w.title.hasPrefix("spend ") { return "credits" }
+  // Every meter above is named. Reaching this means a NEW label was added to a
+  // meter predicate without a name here, which renders an anonymous "usage" row —
+  // that is exactly the bug this line is meant to make obvious rather than hide.
+  return "usage"
+}
+// Poller title fallback protocol: "<anchor> |<detail>|<unicode bar>". The space
+// before the first delimiter preserves every existing "<label> " identity match;
+// the single-character split avoids provider-specific prefix parsing entirely.
+// Old pre-protocol titles show "refreshing…" until the next poll migrates them.
+func meterFallbackDetail(_ w) -> String {
+  if w.title == "5h" { return "waiting…" }
+  if w.title == "7d" { return "waiting…" }
+  if w.title == "cx5h" { return "waiting…" }
+  if w.title == "cx7d" { return "waiting…" }
+  if w.title == "ampu" { return "waiting…" }
+  if w.title == "ampo" { return "waiting…" }
+  let parts = w.title.split(separator: "|")
+  if parts.count > 1 { return String(parts[1]) }
+  return "refreshing…"
+}
+func meterRow(_ w) -> some View {
+  VStack(alignment: .leading, spacing: 3) {
+    if meterIsStale(w) {
+      HStack {
+        Text(meterWindow(w)).font(.system(size: 12, design: .monospaced)).foregroundColor("#CCCAC2")
+        Spacer()
+        Text("stale · refresh needed").font(.system(size: 11, design: .monospaced)).foregroundColor("#FFCC66")
+      }
+    } else if hasProgress(w) {
+      HStack(spacing: 6) {
+        Text(meterWindow(w))
+          .font(.system(size: 12, design: .monospaced)).foregroundColor("#CCCAC2")
+        Spacer()
+        if hasProgressLabel(w) {
+          Text(w.progress.label)
+            .font(.system(size: 11, design: .monospaced)).foregroundColor("#8A9199")
+            .lineLimit(1).truncationMode(.tail).multilineTextAlignment(.trailing)
+        }
+      }
+    } else {
+      HStack(spacing: 6) {
+        Text(meterWindow(w))
+          .font(.system(size: 12, design: .monospaced)).foregroundColor("#CCCAC2")
+        Spacer()
+        Text(meterFallbackDetail(w))
+          .font(.system(size: 11, design: .monospaced)).foregroundColor("#8A9199")
+          .lineLimit(1).truncationMode(.tail).multilineTextAlignment(.trailing)
+      }
+    }
+  }
+}
+
+// ── ⌘N shortcut digit ─────────────────────────────────────────────
+// The gray gutter digit is the workspace's REAL ⌘N key, mirrored from cmux's own
+// WorkspaceShortcutMapper so the badge can never drift from the keystroke. Three
+// things that logic dictates and a naive 1..N counter would get WRONG:
+//   1. ⌘9 is NOT "the 9th" — it always targets the LAST numbered row, so the digit
+//      hangs off the end of the list, not off position 9.
+//   2. The numbering includes the usage sentinels. cmux has no notion of a
+//      "sentinel" — that concept lives only in this file's predicates — so the
+//      meters silently eat ⌘ slots and the visible rows have gaps. Numbering the
+//      visible rows 1..N instead would be a lie that makes ⌘N worse.
+//   3. Since 0.64.22 (#9176) cmux numbers only its ORDINARY sidebar rows: a group's
+//      ANCHOR (drawn as the group header) and every member of a COLLAPSED group are
+//      skipped, and each skip pulls every row below it one key up. This file used
+//      raw `w.index` and got that wrong for anyone with groups; `groups` is bindable
+//      since 0.64.23, so it now mirrors the same rule as JQ_NUMBERED in
+//      bin/cmux-sentinel-setup.sh / -doctor.sh. Without groups it reduces exactly to
+//      the old index math.
+// 0 = this row has no ⌘ key at all (positions 8…count-2 are unreachable).
+func inCollapsedGroup(_ w) -> Bool {
+  return groups.filter { $0.id == w.group && $0.collapsed == true }.count > 0
+}
+func isNumbered(_ w) -> Bool {
+  if isGroupAnchor(w) { return false }
+  if inCollapsedGroup(w) { return false }
+  return true
+}
+func shortcutDigit(_ w) -> Int {
+  if !isNumbered(w) { return 0 }
+  let pos = workspaces.filter { isNumbered($0) && $0.index < w.index }.count
+  let total = workspaces.filter { isNumbered($0) }.count
+  if pos < 8 { return pos + 1 }            // ⌘1…⌘8 = numbered position
+  if pos == total - 1 { return 9 }         // ⌘9 = last numbered row, whatever its position
+  return 0
+}
+func shortcutLabel(_ w) -> String {
+  if shortcutDigit(w) > 0 { return "⌘\(shortcutDigit(w))" }
+  return ""
+}
+
+// ── row visuals ───────────────────────────────────────────────────
+func hasWorkspaceColor(_ w) -> Bool {
+  // Nil literals are not evaluated by cmux's Swift subset. Bind the field instead.
+  if let color = w.color { return color.hasPrefix("#") }
+  return false
+}
+func accentColor(_ w) -> String {
+  if hasWorkspaceColor(w) { return w.color }
+  if isCompacting(w) { return "#DFBFFF" }
+  if isWorking(w) { return "#87D96C" }
+  if needsYou(w) { return "#FFCC66" }
+  return "#73D0FF"
+}
+func accentOpacity(_ w) -> Double {
+  if hasWorkspaceColor(w) { return 1.0 }
+  if isCompacting(w) { return 0.9 }
+  if isWorking(w) { return 0.9 }
+  if needsYou(w) { return 0.9 }
+  return 0.0
+}
+func rowFill(_ w) -> String {
+  if w.selected { return "#33415E" }
+  if needsYou(w) { return "#FFCC66" }
+  return "#FFFFFF"
+}
+func rowFillOpacity(_ w) -> Double {
+  if w.selected { return 0.85 }
+  if needsYou(w) { return 0.10 }
+  if isCompacting(w) { return 0.035 }
+  if isWorking(w) { return 0.035 }
+  return 0.025
+}
+func closeColor(_ w) -> String {
+  if w.selected { return "#FFFFFF" }
+  if needsYou(w) { return "#FFCC66" }
+  return "#A7AFBD"
+}
+
+func row(_ w) -> some View {
+  VStack(spacing: 0) {
+    Button(action: { cmux("workspace.select", workspace_id: w.id) }) {
+      HStack(alignment: .top, spacing: 8) {
+        Capsule().frame(width: 3, height: 26)
+          .foregroundColor(accentColor(w))
+          .opacity(accentOpacity(w))
+        // ⌘N gutter. Fixed width so titles stay aligned on rows that have no key
+        // (shortcutLabel == ""), and dim on purpose — it's a lookup aid, not state.
+        Text(shortcutLabel(w))
+          .font(.system(size: 11, design: .monospaced))
+          .foregroundColor(w.selected ? "#D9D7CE" : "#707A8C")
+          .frame(width: 20)
+        VStack(alignment: .leading, spacing: 2) {
+          HStack(spacing: 5) {
+            // Group header marker: the anchor row stands for the whole group and has no ⌘ key.
+            if isGroupAnchor(w) {
+              Image(systemName: "square.stack").font(.system(size: 10)).foregroundColor("#8A9199")
+            }
+            Text(displayTitle(w))
+              .font(.system(size: 14, design: .monospaced))
+              .fontWeight(w.selected ? .bold : .medium)
+              .foregroundColor(w.selected ? "#FFFFFF" : "#D9D7CE")
+              .lineLimit(titleLineLimit(w)).multilineTextAlignment(.leading)
+            if w.pinned {
+              Image(systemName: "pin.fill").font(.system(size: 9)).foregroundColor("#8A9199")
+            }
+          }
+          // dimension 1 — agent activity
+          if showsActivity(w) {
+            HStack(spacing: 5) {
+              if activityIcon(w) != "" {
+                Image(systemName: activityIcon(w)).font(.system(size: 9)).foregroundColor(activityColor(w))
+              }
+              Text(activityText(w))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(activityColor(w))
+                .lineLimit(1).truncationMode(.tail)
+            }
+          }
+          // dimension 2 — repo / git state (its own row, only when present).
+          // Dirty = a compact yellow "*" trailing the branch (native "main*"), not prose.
+          if hasRepoInfo(w) {
+            HStack(spacing: 4) {
+              Image(systemName: "arrow.triangle.branch").font(.system(size: 9)).foregroundColor("#6E7787")
+              Text(repoText(w))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(repoColor(w))
+                .lineLimit(1).truncationMode(.tail)
+              if w.dirty == true {
+                Text("*").font(.system(size: 12, design: .monospaced)).bold().foregroundColor("#FFCC66")
+              }
+            }
+          }
+        }
+        Spacer()
+        if w.unread > 0 {
+          Text("\(w.unread)")
+            .font(.system(size: 10, design: .monospaced)).bold()
+            .foregroundColor("#1F2430").padding(4)
+            .background { Circle().foregroundColor("#FFCC66") }
+        }
+        Button(action: { cmux("workspace.close", workspace_id: w.id) }) {
+          Image(systemName: "xmark")
+            .font(.system(size: 12)).foregroundColor(closeColor(w))
+            .frame(width: 24, height: 24)
+        }
+      }
+      .padding(6)
+      .background { RoundedRectangle(cornerRadius: 0).foregroundColor(rowFill(w)).opacity(rowFillOpacity(w)) }
+    }
+    .contextMenu {
+      Button(action: { cmux("workspace.select", workspace_id: w.id) }) {
+        Label("Open", systemImage: "arrow.right.circle")
+      }
+      if w.pinned {
+        Button(action: { cmux("workspace.action", workspace_id: w.id, action: "unpin") }) {
+          Label("Unpin", systemImage: "pin.slash")
+        }
+      } else {
+        Button(action: { cmux("workspace.action", workspace_id: w.id, action: "pin") }) {
+          Label("Pin", systemImage: "pin")
+        }
+      }
+      Menu("Color") {
+        Button(action: { cmux("workspace.action", workspace_id: w.id, action: "set-color", color: "#FFCC66") }) { Text("Orange") }
+        Button(action: { cmux("workspace.action", workspace_id: w.id, action: "set-color", color: "#73D0FF") }) { Text("Blue") }
+        Button(action: { cmux("workspace.action", workspace_id: w.id, action: "set-color", color: "#87D96C") }) { Text("Green") }
+        Button(action: { cmux("workspace.action", workspace_id: w.id, action: "set-color", color: "#F28779") }) { Text("Red") }
+        Button(action: { cmux("workspace.action", workspace_id: w.id, action: "clear-color") }) { Text("Clear color") }
+      }
+      Button(action: { cmux("workspace.action", workspace_id: w.id, action: "move-up") }) {
+        Label("Move up", systemImage: "arrow.up")
+      }
+      Button(action: { cmux("workspace.action", workspace_id: w.id, action: "move-down") }) {
+        Label("Move down", systemImage: "arrow.down")
+      }
+      Button(action: { cmux("workspace.action", workspace_id: w.id, action: "move-top") }) {
+        Label("Move to top", systemImage: "arrow.up.to.line")
+      }
+      Divider()
+      Button(action: { cmux("workspace.close", workspace_id: w.id) }) {
+        Label("Close", systemImage: "xmark")
+      }
+    }
+    Divider()
+  }
+}
+
+// BEGIN GENERATED TMUX PANEL
+func tmuxPanel() -> some View {
+  VStack(alignment: .leading, spacing: 6) {
+    Divider()
+    HStack {
+      Text("TMUX").font(.system(size: 11, design: .monospaced)).foregroundColor("#C2D6EF").bold()
+      Spacer()
+      Text("0").font(.system(size: 11, design: .monospaced)).foregroundColor("#AEBED1")
+    }.padding(9)
+    Text("暂无 tmux 会话").font(.system(size: 12, design: .monospaced)).foregroundColor("#AEBED1").padding(9)
+  }
+}
+// END GENERATED TMUX PANEL
+
+// ── layout ────────────────────────────────────────────────────────
+VStack(alignment: .leading, spacing: 0) {
+  HStack(spacing: 10) {
+    Text("Cmux").font(.system(size: 12, design: .monospaced)).bold()
+      .foregroundColor("#D9D7CE")
+    Spacer()
+    if workspaces.filter { needsYou($0) }.count > 0 {
+      HStack(spacing: 4) {
+        Image(systemName: "bell.fill").font(.system(size: 10)).foregroundColor("#FFCC66")
+        Text("\(workspaces.filter { needsYou($0) }.count)")
+          .font(.system(size: 11, design: .monospaced)).bold().foregroundColor("#FFCC66")
+      }
+    }
+    if workspaces.filter { isWorking($0) }.count > 0 {
+      HStack(spacing: 4) {
+        Image(systemName: "bolt.fill").font(.system(size: 10)).foregroundColor("#87D96C")
+        Text("\(workspaces.filter { isWorking($0) }.count)")
+          .font(.system(size: 11, design: .monospaced)).bold().foregroundColor("#87D96C")
+      }
+    }
+    if workspaces.filter { isCompacting($0) }.count > 0 {
+      HStack(spacing: 4) {
+        Image(systemName: "hourglass").font(.system(size: 10)).foregroundColor("#DFBFFF")
+        Text("\(workspaces.filter { isCompacting($0) }.count)")
+          .font(.system(size: 11, design: .monospaced)).bold().foregroundColor("#DFBFFF")
+      }
+    }
+  }
+  .padding(9)
+  Divider()
+
+  // CLAUDE USAGE — one labelled section per provider (same component reused).
+  // Meters sort by WINDOW length (the short 5h/cx5h above the weekly 7d/cx7d), not
+  // by workspace .index — index depends on sentinel creation order and reshuffles
+  // across restarts, which would flip the rows. Match the stable title PREFIX,
+  // never a substring: a weekly countdown can itself contain "5h". The optional
+  // m7d row has no rank of its own — it keeps workspace order, which puts it after
+  // 7d because setup creates it last.
+  if workspaces.filter { isClaudePanelRow($0) }.count > 0 {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("CLAUDE USAGE").font(.system(size: 10, design: .monospaced)).bold().foregroundColor("#8A9199")
+      ForEach(workspaces.filter { isClaudePanelRow($0) }.sorted { $0.title.hasPrefix("5h") && !$1.title.hasPrefix("5h") }) { w in
+        meterRow(w)
+      }
+    }
+    .padding(9)
+    Divider()
+  }
+
+  // CODEX USAGE — same component; hidden unless Codex sentinels exist, so it stays
+  // invisible for Claude-only users. Fed by bin/cmux-codex-usage.sh.
+  if workspaces.filter { isCodexMeter($0) }.count > 0 {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("GPT / CODEX · USED").font(.system(size: 10, design: .monospaced)).bold().foregroundColor("#8A9199")
+      ForEach(workspaces.filter { isCodexMeter($0) }.sorted { $0.title.hasPrefix("cx5h") && !$1.title.hasPrefix("cx5h") }) { w in
+        meterRow(w)
+      }
+    }
+    .padding(9)
+    Divider()
+  }
+
+  if workspaces.filter { isGrokMeter($0) }.count > 0 {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("GROK · USED").font(.system(size: 10, design: .monospaced)).bold().foregroundColor("#8A9199")
+      ForEach(workspaces.filter { isGrokMeter($0) }) { w in
+        meterRow(w)
+      }
+    }
+    .padding(9)
+    Divider()
+  }
+
+  // AMP USAGE — same component; hidden unless Amp sentinels exist. Fed by
+  // bin/cmux-amp-usage.sh. Sorted so "ampu" (the allowance everyone has) sits
+  // above the opt-in "ampo"; both are monthly, so there's no window length to
+  // sort by — `.contains("ampu")` is the equivalent stable key.
+  if workspaces.filter { isAmpMeter($0) }.count > 0 {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("AMP USAGE").font(.system(size: 10, design: .monospaced)).bold().foregroundColor("#8A9199")
+      ForEach(workspaces.filter { isAmpMeter($0) }.sorted { $0.title.contains("ampu") && !$1.title.contains("ampu") }) { w in
+        meterRow(w)
+      }
+    }
+    .padding(9)
+    Divider()
+  }
+
+  // WORKSPACES — labelled section header + count, then the list. This is the
+  // delimiter between the usage panel and the workspace list.
+  HStack(spacing: 8) {
+    Text("WORKSPACES").font(.system(size: 10, design: .monospaced)).bold().foregroundColor("#8A9199")
+    Spacer()
+    Text("\(workspaces.filter { !isUsageMeter($0) }.count)")
+      .font(.system(size: 10, design: .monospaced)).foregroundColor("#6E7787")
+  }
+  .padding(9)
+  Divider()
+
+  // Drag-and-drop reorder (persisted) — the supported way to make the list
+  // draggable; the drop sends workspace_id + target index to workspace.reorder.
+  Reorderable(workspaces.filter { !isUsageMeter($0) }.sorted { $0.index < $1.index }, move: "workspace.reorder") { w in
+    row(w)
+  }
+  tmuxPanel()
+  Spacer()
+}
+.background("#1F2430")

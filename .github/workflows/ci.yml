@@ -1,0 +1,54 @@
+# CI for cmux-sentinel — no cmux on the runner, so no live render check, but the
+# offline suites stub cmux and DO run here. Mirrors `make ci`: shellcheck +
+# secrets guard + markdown + tests. Actions are SHA-pinned
+# (supply-chain hygiene); shellcheck, node, and jq ship on the ubuntu runner, so
+# the only third-party action is checkout.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install markdownlint-cli
+        run: npm install -g markdownlint-cli@0.47.0
+
+      # Pin shellcheck to match local (the Makefile promises no local/CI drift; the
+      # runner's preinstalled shellcheck flags info-level checks 0.11.0 doesn't).
+      - name: Pin shellcheck to v0.11.0
+        run: |
+          curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz | tar -xJ
+          sudo install -m0755 shellcheck-v0.11.0/shellcheck /usr/local/bin/shellcheck
+          shellcheck --version | grep version
+
+      - name: shellcheck + secrets + markdown + offline tests
+        run: make ci
+
+  plist:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate launchd templates and installed substitutions
+        run: |
+          plutil -lint docs/examples/*.plist
+          mkdir -p "$RUNNER_TEMP/plists"
+          for plist in docs/examples/*.plist; do
+            sed "s#/Users/YOUR_USERNAME#$RUNNER_TEMP/home#g" "$plist" > "$RUNNER_TEMP/plists/$(basename "$plist")"
+          done
+          plutil -lint "$RUNNER_TEMP"/plists/*.plist
